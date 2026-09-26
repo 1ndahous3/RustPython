@@ -176,3 +176,10 @@ def test_frombytes_of_itself():
     wide = array("i", [1, 2, 3])
     with assert_raises(TypeError):
         wide.frombytes(memoryview(wide))
+
+
+# Repeating an empty array by a huge count returns at once
+empty = array("i")
+assert empty * (2**63 - 1) == array("i")
+empty *= 2**63 - 1
+assert empty == array("i")
