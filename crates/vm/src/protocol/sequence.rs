@@ -437,7 +437,8 @@ impl PySequence<'_> {
             let iter = self.obj.to_owned().get_iter(vm)?;
             let iter = iter.iter::<PyObjectRef>(vm)?;
             let len = self.length(vm).unwrap_or(0);
-            let mut v = Vec::with_capacity(len);
+            let mut v = Vec::new();
+            v.try_reserve_exact(len).map_err(|_| vm.no_memory_error())?;
             for x in iter {
                 v.push(f(x?.as_ref())?);
             }

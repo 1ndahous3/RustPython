@@ -407,3 +407,10 @@ finally:
 for value in (0, 1, -1):
     with assert_raises(MemoryError):
         value.to_bytes(2**60, "big", signed=True)
+
+# Results too large to allocate raise MemoryError instead of aborting
+assert_raises(MemoryError, lambda: 1 << (2**63 - 1))
+assert_raises(MemoryError, lambda: 1 << 2**64)
+assert_raises(OverflowError, lambda: -5 << 10**30)
+assert 0 << 2**64 == 0
+assert pow(1, 2**63) == 1 and pow(-1, 2**63 + 1) == -1 and pow(0, 2**63) == 0

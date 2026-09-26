@@ -462,6 +462,24 @@ assert x == [0, 1, 2, 3, 4, "a", "b", "c"]
 assert x == y
 assert x == z
 assert x == zz
+
+
+# A huge length hint is a MemoryError, not an aborted process
+class HugeLen:
+    def __len__(self):
+        return 2**62
+
+    def __getitem__(self, i):
+        if i >= 3:
+            raise IndexError
+        return i
+
+
+slice_target = [3, 1, 2]
+with assert_raises(MemoryError):
+    slice_target[1::-1] = HugeLen()
+
+
 # insert sec
 x = a[:]
 y = a[:]

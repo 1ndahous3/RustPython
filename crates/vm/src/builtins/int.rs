@@ -152,6 +152,14 @@ fn inner_pow(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
         float::float_pow(v1, v2, vm)
     } else {
         let value = if let Some(v2) = int2.to_u64() {
+            // |int1| >= 2 raised to v2 has at least (bits - 1) * v2 + 1 bits.
+            let base_bits = int1.bits();
+            if base_bits > 1 {
+                let bits = (base_bits - 1)
+                    .checked_mul(v2)
+                    .and_then(|b| b.checked_add(1));
+                reserve_result_bits(bits, vm)?;
+            }
             return Ok(vm.ctx.new_int(Pow::pow(int1, v2)).into());
         } else if int1.is_one() {
             1
@@ -198,11 +206,34 @@ fn inner_lshift(base: &BigInt, bits: &BigInt, vm: &VirtualMachine) -> PyResult {
         bits,
         |base, bits| base << bits,
         |bits, vm| {
-            bits.to_usize()
-                .ok_or_else(|| vm.new_overflow_error("the number is too large to convert to int"))
+            // CPython's limit: `isize::MAX / 4` digits of 30 bits.
+            const MAX_SHIFT: u128 = (isize::MAX as u128 / 4) * 30;
+            if bits.to_u128().is_none_or(|bits| bits >= MAX_SHIFT) {
+                return Err(vm.new_overflow_error("too many digits in integer"));
+            }
+            let shift = bits.to_u64().ok_or_else(|| vm.no_memory_error())?;
+            reserve_result_bits(base.bits().checked_add(shift), vm)?;
+            usize::try_from(shift).map_err(|_| vm.no_memory_error())
         },
         vm,
     )
+}
+
+/// num-bigint aborts the process when it cannot allocate a result. Before building one of at
+/// least `bits` bits, check that it can be allocated at all, so an impossible result is a
+/// `MemoryError`.
+fn reserve_result_bits(bits: Option<u64>, vm: &VirtualMachine) -> PyResult<()> {
+    // Results below this size are not worth the extra allocation.
+    const CHECK_FROM_BITS: u64 = 1 << 26;
+    let bits = bits.ok_or_else(|| vm.no_memory_error())?;
+    if bits < CHECK_FROM_BITS {
+        return Ok(());
+    }
+    let words =
+        usize::try_from(bits.div_ceil(u64::BITS.into())).map_err(|_| vm.no_memory_error())?;
+    Vec::<u64>::new()
+        .try_reserve_exact(words)
+        .map_err(|_| vm.no_memory_error())
 }
 
 fn inner_rshift(base: &BigInt, bits: &BigInt, vm: &VirtualMachine) -> PyResult {
