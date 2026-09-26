@@ -104,5 +104,15 @@ class Scaled(dict):
 scaled = Scaled()
 _count_elements(scaled, "aab")
 assert scaled == {"a": 110, "b": 10}
+
+
+class CustomGet(dict):
+    def get(self, key, default=None):
+        return 100
+
+
+custom_get = CustomGet()
+_count_elements(custom_get, "aab")
+assert custom_get == {"a": 101, "b": 101}
 with assert_raises(AttributeError):
     _count_elements([], "a")
