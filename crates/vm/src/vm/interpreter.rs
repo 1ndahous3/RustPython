@@ -1,9 +1,9 @@
 #[cfg(feature = "threading")]
 use super::StopTheWorldState;
 use super::{
-    Context, PyConfig, PyGlobalState, VirtualMachine,
+    Context, PyConfig, PyGlobalState, VirtualMachine, VmStorage,
     runtime::{self, InterpreterWhence},
-    setting::Settings,
+    setting::{Paths, Settings},
     thread,
 };
 use crate::{
@@ -13,7 +13,8 @@ use crate::{
 use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
 
-type InitFunc = Box<dyn FnOnce(&mut VirtualMachine)>;
+type InitFunc = Box<dyn FnOnce(&VirtualMachine)>;
+type PathConfigFunc = Box<dyn FnOnce(&Settings, &mut Paths)>;
 
 /// Exit code used when stdout/stderr flush fails during interpreter shutdown.
 /// Matches CPython's behavior (see cpython/Python/pylifecycle.c).
@@ -39,6 +40,10 @@ pub struct InterpreterBuilder {
     module_defs: Vec<&'static builtins::PyModuleDef>,
     frozen_modules: Vec<(&'static str, FrozenModule)>,
     init_hooks: Vec<InitFunc>,
+    prepare_hooks: Vec<Box<dyn FnOnce()>>,
+    path_hooks: Vec<PathConfigFunc>,
+    wasm_id: Option<String>,
+    signal_rx: Option<crate::signal::UserSignalReceiver>,
 }
 
 /// Options for constructing a main or sub-interpreter VM.
@@ -48,6 +53,9 @@ struct InitializeVmOpts<'a> {
     module_defs: Vec<&'static builtins::PyModuleDef>,
     frozen_modules: Vec<(&'static str, FrozenModule)>,
     init_hooks: Vec<InitFunc>,
+    path_hooks: Vec<PathConfigFunc>,
+    wasm_id: Option<String>,
+    signal_rx: Option<crate::signal::UserSignalReceiver>,
     is_main: bool,
     whence: InterpreterWhence,
     /// When `Some`, reuse parent module_defs/frozen/config seeds for a subinterpreter.
@@ -56,9 +64,9 @@ struct InitializeVmOpts<'a> {
 }
 
 /// Shared constructor for main and sub-interpreters.
-fn initialize_vm<F>(opts: InitializeVmOpts<'_>, init: F) -> (VirtualMachine, PyRc<PyGlobalState>)
+fn initialize_vm<F>(opts: InitializeVmOpts<'_>, init: F) -> (VmStorage, PyRc<PyGlobalState>)
 where
-    F: FnOnce(&mut VirtualMachine),
+    F: FnOnce(&VirtualMachine),
 {
     let InitializeVmOpts {
         settings,
@@ -66,6 +74,9 @@ where
         module_defs,
         frozen_modules,
         init_hooks,
+        path_hooks,
+        wasm_id,
+        signal_rx,
         is_main,
         whence,
         parent_state,
@@ -93,7 +104,10 @@ where
     } else {
         // First top-level interpreter wins. Later seeds are ignored.
         super::init_hash_secret(settings.hash_seed);
-        let paths = getpath::init_path_config(&settings);
+        let mut paths = getpath::init_path_config(&settings);
+        for hook in path_hooks {
+            hook(&settings, &mut paths);
+        }
         let config = PyConfig::new(settings, paths);
 
         // Build module_defs map from builtin modules + additional modules
@@ -197,29 +211,27 @@ where
     });
 
     // Create VM with the global state
-    // Note: Don't clone here - init_hooks need exclusive access to mutate state
+    // Finish exclusive construction before publishing the VM's address.
     let mut vm = VirtualMachine::new(ctx, global_state);
-
-    // Execute initialization hooks (can mutate vm.state)
-    for hook in init_hooks {
-        hook(&mut vm);
-    }
-
-    // Call custom init function (can mutate vm.state)
-    init(&mut vm);
+    vm.wasm_id = wasm_id;
+    vm.signal_rx = signal_rx;
+    let vm = VmStorage::new(vm);
 
     // Register before `initialize()` runs any Python: it allocates GC-tracked
     // objects, so a collection on another thread has to be able to stop this
-    // interpreter while that happens. It cannot be registered earlier — the
-    // hooks above take `PyRc::get_mut` on the state, which fails once the
-    // registry holds a weak reference to it.
+    // interpreter while that happens.
     runtime::register_interpreter(&vm.state);
-
     // `initialize()` runs Python bytecode directly (e.g. importing `codecs`
     // and `encodings`) before any `enter_vm` scope exists, so attach this
     // thread for the duration so type cache reads see it as ATTACHED.
-    let vm_guard = thread::VmBootstrapGuard::new(&vm);
+    let vm_guard = thread::VmEntryGuard::new(&vm);
     vm.initialize();
+
+    // Hooks can use the initialized VM, but cannot replace its registered state.
+    for hook in init_hooks {
+        hook(&vm);
+    }
+    init(&vm);
     vm.state.ready.store(true, Ordering::Release);
     drop(vm_guard);
 
@@ -234,21 +246,6 @@ fn create_subinterpreter_from_parent(
     config: runtime::InterpreterConfig,
 ) -> Result<Interpreter, &'static str> {
     config.check()?;
-    // Suspend the caller's current VM attachment (if any) for the duration
-    // of subinterpreter initialization. Nested bootstrap would otherwise
-    // swap `CURRENT_THREAD_SLOT` to the new interpreter while leaving the
-    // outer interpreter's attach state inconsistent. Always restore, even
-    // if initialization panics.
-    #[cfg(feature = "threading")]
-    let _restore_parent = {
-        let saved = thread::current_vm_is_set().then(thread::save_current_thread);
-        scopeguard::guard(saved, |saved| {
-            if let Some(saved) = saved {
-                thread::restore_current_thread(saved);
-            }
-        })
-    };
-
     let (vm, global_state) = initialize_vm(
         InitializeVmOpts {
             // settings unused when parent_state is Some
@@ -257,6 +254,9 @@ fn create_subinterpreter_from_parent(
             module_defs: Vec::new(),
             frozen_modules: Vec::new(),
             init_hooks: Vec::new(),
+            path_hooks: Vec::new(),
+            wasm_id: None,
+            signal_rx: None,
             is_main: false,
             whence: InterpreterWhence::Stdlib,
             parent_state: Some(&parent.state),
@@ -282,6 +282,10 @@ impl InterpreterBuilder {
             module_defs: Vec::new(),
             frozen_modules: Vec::new(),
             init_hooks: Vec::new(),
+            prepare_hooks: Vec::new(),
+            path_hooks: Vec::new(),
+            wasm_id: None,
+            signal_rx: None,
         }
     }
 
@@ -291,6 +295,39 @@ impl InterpreterBuilder {
     #[must_use]
     pub fn settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Run native preparation at build time, before constructing the VM.
+    /// Use `init_hook` for code that needs an initialized VM.
+    #[must_use]
+    pub fn prepare_hook(mut self, prepare: impl FnOnce() + 'static) -> Self {
+        self.prepare_hooks.push(Box::new(prepare));
+        self
+    }
+
+    /// Customize computed paths using the final settings, before VM construction.
+    /// Hooks run in registration order after path discovery.
+    #[must_use]
+    pub fn configure_paths(
+        mut self,
+        configure: impl FnOnce(&Settings, &mut Paths) + 'static,
+    ) -> Self {
+        self.path_hooks.push(Box::new(configure));
+        self
+    }
+
+    /// Set the identity used by the browser embedding before initialization.
+    #[must_use]
+    pub fn wasm_id(mut self, id: String) -> Self {
+        self.wasm_id = Some(id);
+        self
+    }
+
+    /// Set the custom signal channel before initialization.
+    #[must_use]
+    pub fn user_signal_channel(mut self, receiver: crate::signal::UserSignalReceiver) -> Self {
+        self.signal_rx = Some(receiver);
         self
     }
 
@@ -332,8 +369,8 @@ impl InterpreterBuilder {
     /// Add a custom initialization hook.
     ///
     /// Hooks are executed in the order they are added during interpreter creation.
-    /// This function will be called after modules are registered but before
-    /// the VM is initialized, allowing for additional customization.
+    /// Hooks receive a fully initialized VM with this thread attached.
+    /// Configure construction options through the builder instead.
     ///
     /// # Example
     /// ```
@@ -348,7 +385,7 @@ impl InterpreterBuilder {
     #[must_use]
     pub fn init_hook<F>(mut self, init: F) -> Self
     where
-        F: FnOnce(&mut VirtualMachine) + 'static,
+        F: FnOnce(&VirtualMachine) + 'static,
     {
         self.init_hooks.push(Box::new(init));
         self
@@ -381,6 +418,9 @@ impl InterpreterBuilder {
     /// This consumes the configuration and returns a fully initialized Interpreter.
     #[must_use]
     pub fn build(self) -> Interpreter {
+        for prepare in self.prepare_hooks {
+            prepare();
+        }
         let (vm, global_state) = initialize_vm(
             InitializeVmOpts {
                 settings: self.settings,
@@ -388,6 +428,9 @@ impl InterpreterBuilder {
                 module_defs: self.module_defs,
                 frozen_modules: self.frozen_modules,
                 init_hooks: self.init_hooks,
+                path_hooks: self.path_hooks,
+                wasm_id: self.wasm_id,
+                signal_rx: self.signal_rx,
                 is_main: true,
                 whence: InterpreterWhence::Runtime,
                 parent_state: None,
@@ -437,7 +480,7 @@ impl Default for InterpreterBuilder {
 /// ```
 pub struct Interpreter {
     pub global_state: PyRc<PyGlobalState>,
-    vm: VirtualMachine,
+    vm: VmStorage,
 }
 
 impl Interpreter {
@@ -465,12 +508,12 @@ impl Interpreter {
         Self::with_init(settings, |_| {})
     }
 
-    /// Create with initialize function taking mutable vm reference.
+    /// Create with a hook receiving the initialized VM on an attached thread.
     ///
     /// Note: This is a legacy API. To add stdlib, use `Interpreter::builder()` instead.
     pub fn with_init<F>(settings: Settings, init: F) -> Self
     where
-        F: FnOnce(&mut VirtualMachine),
+        F: FnOnce(&VirtualMachine),
     {
         let (vm, global_state) = initialize_vm(
             InitializeVmOpts {
@@ -479,6 +522,9 @@ impl Interpreter {
                 module_defs: Vec::new(),
                 frozen_modules: Vec::new(),
                 init_hooks: Vec::new(),
+                path_hooks: Vec::new(),
+                wasm_id: None,
+                signal_rx: None,
                 is_main: true,
                 whence: InterpreterWhence::Runtime,
                 parent_state: None,
@@ -645,6 +691,7 @@ impl Interpreter {
     /// 1. Final stdout/stderr flush.
     ///
     /// Note that calling `finalize` is not necessary by purpose though.
+    #[must_use]
     pub fn finalize(self, exc: Option<PyBaseExceptionRef>) -> u32 {
         self.enter(|vm| {
             let mut flush_status = vm.flush_std();

@@ -466,6 +466,7 @@ fn owned_interpreters() -> &'static Mutex<HashMap<i64, OwnedInterpreter>> {
 
 /// Transfer ownership of `interp` to the runtime, returning its id.
 #[cfg(feature = "threading")]
+#[must_use]
 pub fn store_owned_interpreter(interp: crate::Interpreter) -> i64 {
     let id = interp.id();
     let root_id = interp.global_state.runtime_root_id;

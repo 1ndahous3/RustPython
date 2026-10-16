@@ -142,7 +142,7 @@ thread_local! {
     /// drops it while the VM is still current, so object destructors can still find
     /// their VM.
     #[cfg(feature = "threading")]
-    static GILSTATE_VM: RefCell<Option<Box<ThreadedVirtualMachine>>> = const { RefCell::new(None) };
+    static GILSTATE_VM: RefCell<Option<ThreadedVirtualMachine>> = const { RefCell::new(None) };
 
     pub(crate) static COROUTINE_ORIGIN_TRACKING_DEPTH: Cell<u32> = const { Cell::new(0) };
 
@@ -200,20 +200,8 @@ pub fn with_current_vm<R>(f: impl FnOnce(&VirtualMachine) -> R) -> R {
 }
 
 fn set_current_vm<R>(vm: &VirtualMachine, f: impl FnOnce() -> R) -> R {
-    // Attach to this VM's interpreter, detaching the enclosing one if this is a
-    // switch between interpreters on the same OS thread.
-    #[cfg(feature = "threading")]
-    let switched = begin_interpreter_section(vm);
-
-    VM_STACK.with(|vms| {
-        vms.borrow_mut().push(vm.into());
-        scopeguard::defer! {
-            vms.borrow_mut().pop();
-            #[cfg(feature = "threading")]
-            end_interpreter_section(switched);
-        }
-        f()
-    })
+    let _guard = VmEntryGuard::new(vm);
+    f()
 }
 
 /// Pointer to the GC state of the interpreter running on this thread.
@@ -251,45 +239,46 @@ pub fn enter_vm<R>(vm: &VirtualMachine, f: impl FnOnce() -> R) -> R {
     set_current_vm(vm, f)
 }
 
-/// RAII counterpart to `enter_vm`, for code that runs Python bytecode across
-/// several statements interspersed with `&mut VirtualMachine` calls
-/// (`VirtualMachine::initialize`), where a single closure-based `enter_vm`
-/// scope cannot be expressed because the borrow checker won't let a closure
-/// hold `&mut VirtualMachine` at the same time `enter_vm` reborrows it as
-/// `&VirtualMachine`. Construction only needs a transient `&VirtualMachine`
-/// borrow, so it can be dropped before subsequent `&mut` use.
-///
-/// Without this, code that runs Python bytecode before any `enter_vm` scope
-/// exists would leave the thread not ATTACHED, making lock-free type cache
-/// reads unsound.
+/// Keep a shared VM borrow alive for the entire TLS entry, including bootstrap.
+/// The guard restores the previous attachment on normal return and unwind.
 #[must_use]
-pub(crate) struct VmBootstrapGuard {
+pub(crate) struct VmEntryGuard<'vm> {
+    _vm: &'vm VirtualMachine,
+    #[cfg(feature = "threading")]
+    restore_attached: bool,
     #[cfg(feature = "threading")]
     switched: bool,
 }
 
-impl VmBootstrapGuard {
-    pub(crate) fn new(vm: &VirtualMachine) -> Self {
+impl<'vm> VmEntryGuard<'vm> {
+    pub(crate) fn new(vm: &'vm VirtualMachine) -> Self {
+        // Attach to this VM's interpreter, detaching the enclosing one if this is a
+        // switch between interpreters on the same OS thread.
+        #[cfg(feature = "threading")]
+        let restore_attached = current_slot_is_attached();
         #[cfg(feature = "threading")]
         let switched = begin_interpreter_section(vm);
 
         VM_STACK.with(|vms| vms.borrow_mut().push(vm.into()));
 
         Self {
+            _vm: vm,
+            #[cfg(feature = "threading")]
+            restore_attached,
             #[cfg(feature = "threading")]
             switched,
         }
     }
 }
 
-impl Drop for VmBootstrapGuard {
+impl Drop for VmEntryGuard<'_> {
     fn drop(&mut self) {
         VM_STACK.with(|vms| {
             vms.borrow_mut().pop();
         });
 
         #[cfg(feature = "threading")]
-        end_interpreter_section(self.switched);
+        end_interpreter_section(self.switched, self.restore_attached);
     }
 }
 
@@ -304,7 +293,7 @@ pub enum CurrentVmAttachState {
 #[cfg(feature = "threading")]
 pub struct SavedThreadState {
     vm_stack: Vec<NonNull<VirtualMachine>>,
-    gilstate_vm: Option<Box<ThreadedVirtualMachine>>,
+    gilstate_vm: Option<ThreadedVirtualMachine>,
 }
 
 /// Detach the current native thread and preserve its VM context for restoration.
@@ -373,8 +362,8 @@ pub fn attach_current_thread(
 
     GILSTATE_VM.with(|gilstate_vm| {
         let mut gilstate_vm = gilstate_vm.borrow_mut();
-        let threaded_vm = gilstate_vm.get_or_insert_with(|| Box::new(make_vm()));
-        let vm = &threaded_vm.vm;
+        let threaded_vm = gilstate_vm.get_or_insert_with(make_vm);
+        let vm: &VirtualMachine = &threaded_vm.vm;
 
         vm.c_stack_soft_limit
             .set(VirtualMachine::calculate_c_stack_soft_limit());
@@ -413,7 +402,7 @@ pub fn release_current_thread(state: CurrentVmAttachState) {
 /// Ensure this OS thread has a [`ThreadSlot`] registered with `vm`'s interpreter
 /// and make it the current slot.
 ///
-/// Called automatically by `enter_vm()` / `VmBootstrapGuard` whenever a VM
+/// Called automatically by `enter_vm()` / `VmEntryGuard` whenever a VM
 /// becomes current. Switching between interpreters on the same OS thread swaps
 /// `CURRENT_THREAD_SLOT` to that interpreter's slot (creating one if needed).
 #[cfg(feature = "threading")]
@@ -538,10 +527,10 @@ fn begin_interpreter_section(vm: &VirtualMachine) -> bool {
     true
 }
 
-/// Undo [`begin_interpreter_section`]: detach this interpreter and re-attach the
-/// enclosing one, if any. Call after the VM has been popped from `VM_STACK`.
+/// Undo [`begin_interpreter_section`]: detach this interpreter and restore the
+/// enclosing one's previous attachment. Call after popping the VM from `VM_STACK`.
 #[cfg(feature = "threading")]
-fn end_interpreter_section(switched: bool) {
+fn end_interpreter_section(switched: bool, restore_attached: bool) {
     if !switched {
         return;
     }
@@ -553,7 +542,9 @@ fn end_interpreter_section(switched: bool) {
         // SAFETY: entries on VM_STACK are valid for their enter/set_current_vm scope.
         let vm = unsafe { vm_ptr.as_ref() };
         set_current_thread_slot(ensure_thread_slot(vm));
-        attach_thread(vm);
+        if restore_attached {
+            attach_thread(vm);
+        }
     }
 }
 
@@ -1322,7 +1313,7 @@ where
         let vms = vms.borrow();
         // Fast path: at most one interpreter is ever ATTACHED per OS thread,
         // and it is always the one on top of `VM_STACK` — every push onto
-        // VM_STACK (set_current_vm, VmBootstrapGuard) is paired with an attach
+        // VM_STACK (set_current_vm, VmEntryGuard) is paired with an attach
         // *before* the push, and every pop is paired with a detach (or a
         // re-attach of the newly-exposed top) in `end_interpreter_section`.
         // So if `obj`'s owning interpreter is the current top, this thread is
@@ -1370,7 +1361,7 @@ where
 #[must_use = "ThreadedVirtualMachine does nothing unless you move it to another thread and call .run()"]
 #[cfg(feature = "threading")]
 pub struct ThreadedVirtualMachine {
-    pub(super) vm: VirtualMachine,
+    pub(super) vm: super::VmStorage,
 }
 
 #[cfg(feature = "threading")]
@@ -1477,7 +1468,7 @@ impl VirtualMachine {
             signal_rx: None,
             repr_guards: RefCell::default(),
             state: self.state.clone(),
-            initialized: self.initialized,
+            initialized: self.initialized.clone(),
             recursion_depth: Cell::new(0),
             #[cfg(any(miri, target_env = "musl"))]
             native_recursion_depth: Cell::new(0),
@@ -1493,6 +1484,8 @@ impl VirtualMachine {
             pending_gen_resume: core::cell::UnsafeCell::new(None),
             trampoline_stack: core::cell::UnsafeCell::new(Vec::new()),
         };
-        ThreadedVirtualMachine { vm }
+        ThreadedVirtualMachine {
+            vm: super::VmStorage::new(vm),
+        }
     }
 }

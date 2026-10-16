@@ -106,11 +106,7 @@ impl StoredVirtualMachine {
                 .add_frozen_modules(rustpython_vm::py_freeze!(dir = "../Lib"));
         }
 
-        let interp = builder
-            .init_hook(move |vm| {
-                vm.wasm_id = Some(id);
-            })
-            .build();
+        let interp = builder.wasm_id(id).build();
 
         let scope = interp.enter(|vm| vm.new_scope_with_builtins());
 

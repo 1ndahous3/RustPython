@@ -195,7 +195,7 @@ fn bless_my_loader(
     vm: &VirtualMachine,
 ) -> PyResult<Option<PyObjectRef>> {
     let external = vm
-        .importlib
+        .importlib()
         .get_attr("_bootstrap_external", vm)
         .or_else(|_| vm.import("importlib._bootstrap_external", 0))?;
     if vm.is_none(&external) {

@@ -473,7 +473,7 @@ impl Representable for PyModule {
     #[inline]
     fn repr(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
         // Use cached importlib reference (like interp->importlib)
-        let module_repr = vm.importlib.get_attr("_module_repr", vm)?;
+        let module_repr = vm.importlib().get_attr("_module_repr", vm)?;
         let repr = module_repr.call((zelf.to_owned(),), vm)?;
         repr.downcast()
             .map_err(|_| vm.new_type_error("_module_repr did not return a string"))

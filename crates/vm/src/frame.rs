@@ -5270,12 +5270,14 @@ impl ExecutingFrame<'_> {
                     CommonConstant::BuiltinAll => vm
                         .callable_cache
                         .builtin_all
-                        .clone()
+                        .get()
+                        .cloned()
                         .expect("builtin_all not initialized"),
                     CommonConstant::BuiltinAny => vm
                         .callable_cache
                         .builtin_any
-                        .clone()
+                        .get()
+                        .cloned()
                         .expect("builtin_any not initialized"),
                     CommonConstant::BuiltinList => vm.ctx.types.list_type.to_owned().into(),
                     CommonConstant::BuiltinSet => vm.ctx.types.set_type.to_owned().into(),
@@ -6985,7 +6987,7 @@ impl ExecutingFrame<'_> {
                         && vm
                             .callable_cache
                             .len
-                            .as_ref()
+                            .get()
                             .is_some_and(|len_callable| callable.is(len_callable))
                     {
                         let len = obj.length(vm)?;
@@ -7012,7 +7014,7 @@ impl ExecutingFrame<'_> {
                     if vm
                         .callable_cache
                         .isinstance
-                        .as_ref()
+                        .get()
                         .is_some_and(|isinstance_callable| callable.is(isinstance_callable))
                     {
                         // Stack: [callable, self_or_null, args...]; effective_nargs == 2,
@@ -7237,7 +7239,7 @@ impl ExecutingFrame<'_> {
                     if vm
                         .callable_cache
                         .list_append
-                        .as_ref()
+                        .get()
                         .is_some_and(|list_append| callable.is(list_append))
                         && self_or_null_is_some
                         && self_is_list
@@ -11295,7 +11297,7 @@ impl ExecutingFrame<'_> {
                     && vm
                         .callable_cache
                         .list_append
-                        .as_ref()
+                        .get()
                         .is_some_and(|list_append| callable.is(list_append))
                 {
                     Instruction::CallListAppend
@@ -11339,7 +11341,7 @@ impl ExecutingFrame<'_> {
                     && vm
                         .callable_cache
                         .len
-                        .as_ref()
+                        .get()
                         .is_some_and(|len_callable| callable.is(len_callable))
                 {
                     Instruction::CallLen
@@ -11352,7 +11354,7 @@ impl ExecutingFrame<'_> {
                     && vm
                         .callable_cache
                         .isinstance
-                        .as_ref()
+                        .get()
                         .is_some_and(|isinstance_callable| callable.is(isinstance_callable))
                 {
                     Instruction::CallIsinstance

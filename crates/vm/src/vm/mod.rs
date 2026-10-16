@@ -69,6 +69,24 @@ pub use runtime::{
 };
 pub use setting::{CheckHashPycsMode, Paths, PyConfig, Settings};
 
+/// Stable storage for interpreter and worker handles. Only shared VM
+/// access escapes; moving a handle cannot move or replace its published VM.
+pub(super) struct VmStorage(Box<VirtualMachine>);
+
+impl VmStorage {
+    fn new(vm: VirtualMachine) -> Self {
+        Self(Box::new(vm))
+    }
+}
+
+impl core::ops::Deref for VmStorage {
+    type Target = VirtualMachine;
+
+    fn deref(&self) -> &VirtualMachine {
+        &self.0
+    }
+}
+
 pub const MAX_MEMORY_SIZE: usize = isize::MAX as usize;
 
 // Objects are live when they are on stack, or referenced by a name (for now)
@@ -91,8 +109,8 @@ pub struct VirtualMachine {
     datastack: core::cell::UnsafeCell<crate::datastack::DataStack>,
     pub wasm_id: Option<String>,
     exceptions: RefCell<ExceptionStack>,
-    pub import_func: PyObjectRef,
-    pub(crate) importlib: PyObjectRef,
+    pub(crate) import_func: OnceCell<PyObjectRef>,
+    pub(crate) importlib: OnceCell<PyObjectRef>,
     pub profile_func: RefCell<PyObjectRef>,
     pub trace_func: RefCell<PyObjectRef>,
     pub use_tracing: Cell<bool>,
@@ -105,7 +123,7 @@ pub struct VirtualMachine {
     pub(crate) signal_rx: Option<signal::UserSignalReceiver>,
     pub repr_guards: RefCell<HashSet<usize>>,
     pub state: PyRc<PyGlobalState>,
-    pub initialized: bool,
+    initialized: Cell<bool>,
     recursion_depth: Cell<usize>,
     /// Depth of native recursion that pushes no Python frame, counted only
     /// where the stack pointer cannot be read. Everywhere else the native
@@ -833,11 +851,11 @@ pub(super) fn stw_trace(msg: core::fmt::Arguments<'_>) {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallableCache {
-    pub len: Option<PyObjectRef>,
-    pub isinstance: Option<PyObjectRef>,
-    pub list_append: Option<PyObjectRef>,
-    pub builtin_all: Option<PyObjectRef>,
-    pub builtin_any: Option<PyObjectRef>,
+    pub len: OnceCell<PyObjectRef>,
+    pub isinstance: OnceCell<PyObjectRef>,
+    pub list_append: OnceCell<PyObjectRef>,
+    pub builtin_all: OnceCell<PyObjectRef>,
+    pub builtin_any: OnceCell<PyObjectRef>,
 }
 
 /// Per-interpreter shared state (≈ CPython `PyInterpreterState`).
@@ -1185,18 +1203,38 @@ enum LengthHint<'a> {
 }
 
 impl VirtualMachine {
-    fn init_callable_cache(&mut self) -> PyResult<()> {
-        self.callable_cache.len = Some(self.builtins.get_attr("len", self)?);
-        self.callable_cache.isinstance = Some(self.builtins.get_attr("isinstance", self)?);
+    fn init_callable_cache(&self) -> PyResult<()> {
+        assert!(
+            self.callable_cache
+                .len
+                .set(self.builtins.get_attr("len", self)?)
+                .is_ok()
+        );
+        assert!(
+            self.callable_cache
+                .isinstance
+                .set(self.builtins.get_attr("isinstance", self)?)
+                .is_ok()
+        );
         let list_append = self
             .ctx
             .types
             .list_type
             .get_attr(self.ctx.intern_str("append"))
             .ok_or_else(|| self.new_runtime_error("failed to cache list.append"))?;
-        self.callable_cache.list_append = Some(list_append);
-        self.callable_cache.builtin_all = Some(self.builtins.get_attr("all", self)?);
-        self.callable_cache.builtin_any = Some(self.builtins.get_attr("any", self)?);
+        assert!(self.callable_cache.list_append.set(list_append).is_ok());
+        assert!(
+            self.callable_cache
+                .builtin_all
+                .set(self.builtins.get_attr("all", self)?)
+                .is_ok()
+        );
+        assert!(
+            self.callable_cache
+                .builtin_any
+                .set(self.builtins.get_attr("any", self)?)
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -1289,8 +1327,6 @@ impl VirtualMachine {
         let builtins = new_module(stdlib::builtins::module_def(&ctx));
         let sys_module = new_module(stdlib::sys::module_def(&ctx));
 
-        let import_func = ctx.none();
-        let importlib = ctx.none();
         let profile_func = RefCell::new(ctx.none());
         let trace_func = RefCell::new(ctx.none());
         let signal_handlers = OnceCell::from(SignalHandlers::default());
@@ -1302,8 +1338,8 @@ impl VirtualMachine {
             datastack: core::cell::UnsafeCell::new(crate::datastack::DataStack::new()),
             wasm_id: None,
             exceptions: RefCell::default(),
-            import_func,
-            importlib,
+            import_func: OnceCell::new(),
+            importlib: OnceCell::new(),
             profile_func,
             trace_func,
             use_tracing: Cell::new(false),
@@ -1314,7 +1350,7 @@ impl VirtualMachine {
             signal_rx: None,
             repr_guards: RefCell::default(),
             state,
-            initialized: false,
+            initialized: Cell::new(false),
             recursion_depth: Cell::new(0),
             #[cfg(any(miri, target_env = "musl"))]
             native_recursion_depth: Cell::new(0),
@@ -1350,7 +1386,7 @@ impl VirtualMachine {
     /// set up the encodings search function
     /// init_importlib must be called before this call
     #[cfg(feature = "encodings")]
-    fn import_encodings(&mut self) -> PyResult<()> {
+    fn import_encodings(&self) -> PyResult<()> {
         self.import("encodings", 0).map_err(|import_err| {
             let rustpythonpath_env = crate::host_env::os::var("RUSTPYTHONPATH").ok();
             let pythonpath_env = crate::host_env::os::var("PYTHONPATH").ok();
@@ -1387,7 +1423,7 @@ impl VirtualMachine {
         Ok(())
     }
 
-    fn import_ascii_utf8_encodings(&mut self) -> PyResult<()> {
+    fn import_ascii_utf8_encodings(&self) -> PyResult<()> {
         // Use the Python import machinery (FrozenImporter) so modules get
         // proper __spec__ and __loader__ attributes.
         self.import("codecs", 0)?;
@@ -1441,10 +1477,10 @@ impl VirtualMachine {
         Ok(())
     }
 
-    fn initialize(&mut self) {
+    fn initialize(&self) {
         flame_guard!("init VirtualMachine");
 
-        assert!(!self.initialized, "Double Initialize Error");
+        assert!(!self.initialized.get(), "Double Initialize Error");
 
         // Process main-thread identity is owned by the main interpreter only
         // (used for signal handling / `_thread._is_main_interpreter` helpers).
@@ -1467,7 +1503,7 @@ impl VirtualMachine {
             "failed to initialize bootstrap stderr",
         );
 
-        let mut essential_init = || -> PyResult {
+        let essential_init = || -> PyResult {
             import::import_builtin(self, "_typing")?;
             #[cfg(all(not(target_arch = "wasm32"), feature = "host_env"))]
             import::import_builtin(self, "_signal")?;
@@ -1620,12 +1656,27 @@ impl VirtualMachine {
             );
         }
 
-        self.initialized = true;
+        self.initialized.set(true);
     }
 
-    /// Set the custom signal channel for the interpreter
-    pub fn set_user_signal_channel(&mut self, signal_rx: signal::UserSignalReceiver) {
-        self.signal_rx = Some(signal_rx);
+    /// Whether core initialization has completed for this VM.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.get()
+    }
+
+    /// The original builtin import function, or None before import bootstrap.
+    #[must_use]
+    pub fn import_func(&self) -> &PyObject {
+        self.import_func
+            .get()
+            .map_or_else(|| self.ctx.none.as_object(), |f| f.as_ref())
+    }
+
+    pub(crate) fn importlib(&self) -> &PyObject {
+        self.importlib
+            .get()
+            .map_or_else(|| self.ctx.none.as_object(), |m| m.as_ref())
     }
 
     /// Execute Python bytecode (`.pyc`) from an in-memory buffer.
@@ -3330,7 +3381,7 @@ impl VirtualMachine {
             .builtins
             .get_attr(identifier!(self, __import__), self)
             .map_err(|_| self.new_import_error("__import__ not found", module.to_owned()))?;
-        if !current_import.is(&self.import_func) {
+        if !current_import.is(self.import_func()) {
             // `builtins.__import__` was replaced by user code; must go
             // through it so overrides (test_import, test_importlib,
             // test_builtin) still take effect.

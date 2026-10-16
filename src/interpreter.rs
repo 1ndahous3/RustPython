@@ -16,19 +16,19 @@ impl InterpreterBuilderExt for InterpreterBuilder {
         let defs = rustpython_stdlib::stdlib_module_defs(&self.ctx);
         let builder = self.add_native_modules(&defs);
         #[cfg(all(feature = "ssl-rustls-aws-lc", not(target_arch = "wasm32")))]
-        let builder = builder.init_hook(install_default_tls_provider);
+        let builder = builder.prepare_hook(install_default_tls_provider);
 
         cfg_select! {
             feature = "freeze-stdlib" => builder
                 .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
-                .init_hook(set_frozen_stdlib_dir),
-            _ => builder.init_hook(setup_dynamic_stdlib),
+                .configure_paths(set_frozen_stdlib_dir),
+            _ => builder.configure_paths(setup_dynamic_stdlib),
         }
     }
 }
 
 #[cfg(all(feature = "ssl-rustls-aws-lc", not(target_arch = "wasm32")))]
-fn install_default_tls_provider(_vm: &mut crate::VirtualMachine) {
+fn install_default_tls_provider() {
     use rustls::crypto::aws_lc_rs;
     use rustpython_stdlib::ssl::providers::CryptoExt;
 
@@ -52,19 +52,19 @@ fn install_default_tls_provider(_vm: &mut crate::VirtualMachine) {
 
 /// Set stdlib_dir for frozen standard library
 #[cfg(all(feature = "stdlib", feature = "freeze-stdlib"))]
-fn set_frozen_stdlib_dir(vm: &mut crate::VirtualMachine) {
-    use rustpython_vm::common::rc::PyRc;
-
-    let state = PyRc::get_mut(&mut vm.state).unwrap();
-    state.config.paths.stdlib_dir = Some(rustpython_pylib::LIB_PATH.to_owned());
+fn set_frozen_stdlib_dir(
+    _settings: &rustpython_vm::Settings,
+    paths: &mut rustpython_vm::vm::Paths,
+) {
+    paths.stdlib_dir = Some(rustpython_pylib::LIB_PATH.to_owned());
 }
 
 /// Setup dynamic standard library loading from filesystem
 #[cfg(all(feature = "stdlib", not(feature = "freeze-stdlib")))]
-fn setup_dynamic_stdlib(vm: &mut crate::VirtualMachine) {
-    use rustpython_vm::common::rc::PyRc;
-
-    let state = PyRc::get_mut(&mut vm.state).unwrap();
+fn setup_dynamic_stdlib(
+    _settings: &rustpython_vm::Settings,
+    config: &mut rustpython_vm::vm::Paths,
+) {
     let paths: Vec<String> = collect_stdlib_paths()
         .into_iter()
         .map(|p| {
@@ -85,12 +85,12 @@ fn setup_dynamic_stdlib(vm: &mut crate::VirtualMachine) {
 
     // Set stdlib_dir to the first stdlib path if available
     if let Some(first_path) = paths.first() {
-        state.config.paths.stdlib_dir = Some(first_path.clone());
+        config.stdlib_dir = Some(first_path.clone());
     }
 
     // Insert at the beginning so stdlib comes before user paths
     for path in paths.into_iter().rev() {
-        state.config.paths.module_search_paths.insert(0, path);
+        config.module_search_paths.insert(0, path);
     }
 }
 
