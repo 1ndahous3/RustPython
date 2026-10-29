@@ -16,7 +16,7 @@ mod _tokenize {
     use alloc::sync::Arc;
     use core::fmt;
     use ruff_python_ast::PySourceType;
-    use ruff_python_ast::token::{Token, TokenKind};
+    use ruff_python_ast::token::{Token, TokenFlags, TokenKind};
     use ruff_python_parser::{
         LexicalErrorType, ParseError, ParseErrorType, parse_unchecked_source,
     };
@@ -116,8 +116,11 @@ mod _tokenize {
                         if line.is_empty() {
                             let accumulated = core::mem::take(source);
                             let parsed = parse_unchecked_source(&accumulated, PySourceType::Python);
-                            let tokens: Vec<Token> = parsed.tokens().iter().copied().collect();
+                            let mut tokens: Vec<Token> = parsed.tokens().iter().copied().collect();
                             let errors: Vec<ParseError> = parsed.errors().to_vec();
+                            if zelf.extra_tokens {
+                                restore_decimal_tokens(&mut tokens, &errors);
+                            }
                             let line_index = LineIndex::from_source_text(&accumulated);
                             let implicit_nl = !accumulated.ends_with('\n');
                             state.phase = TokenizerPhase::Yielding {
@@ -145,6 +148,33 @@ mod _tokenize {
                         return Ok(PyIterReturn::StopIteration(None));
                     }
                 }
+            }
+        }
+    }
+
+    // Public tokenize deliberately accepts decimal literals
+    // that the compiler rejects. Keep this adaptation out of compiler lexing.
+    fn restore_decimal_tokens(tokens: &mut [Token], errors: &[ParseError]) {
+        if errors.is_empty() {
+            return;
+        }
+        let leading_zeros: std::collections::HashSet<_> = errors
+            .iter()
+            .filter_map(|error| {
+                matches!(
+                    error.error,
+                    ParseErrorType::Lexical(LexicalErrorType::LeadingZerosInDecimalInteger)
+                )
+                .then_some(error.location.start())
+            })
+            .collect();
+        if leading_zeros.is_empty() {
+            return;
+        }
+        for token in tokens {
+            if token.kind() == TokenKind::Unknown && leading_zeros.contains(&token.range().start())
+            {
+                *token = Token::new(TokenKind::Int, token.range(), TokenFlags::empty());
             }
         }
     }

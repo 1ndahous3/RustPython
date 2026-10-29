@@ -2240,7 +2240,6 @@ class InvalidPythonTests(TestCase):
         tokens = list(tokenize.generate_tokens(StringIO(source).readline))
         self.assertEqual(tokens, expected_tokens)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON; Diff is 855 characters long. Set self.maxDiff to None to see it.
     def test_number_starting_with_zero(self):
         source = "01234"
         expected_tokens = [
